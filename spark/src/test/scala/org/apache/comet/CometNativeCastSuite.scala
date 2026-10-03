@@ -1068,6 +1068,29 @@ class CometNativeCastSuite extends CometTestBase with AdaptiveSparkPlanHelper {
       .foreach(castTest(values, _))
   }
 
+  test("cast StringType to DateType - whitespace trim parity") {
+    castTest(trimPaddedValues("2020-01-01").toDF("a"), DataTypes.DateType)
+  }
+
+  test("cast StringType to timestamp types - whitespace trim parity") {
+    withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+      val values = trimPaddedValues("2020-01-01 12:34:56").toDF("a")
+      Seq(DataTypes.TimestampType, DataTypes.TimestampNTZType).foreach(castTest(values, _))
+    }
+  }
+
+  test("cast StringType to timestamp types - ANSI rejects a value that trims to nothing") {
+    // Spark's parseTimestampString finds no segments in such a value, so ANSI mode raises
+    // CAST_INVALID_INPUT for it like for any other malformed value. The batch-wide ANSI check in
+    // the parity test above cannot see this, since other rows in its batch raise as well.
+    withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+      for {
+        value <- Seq("", " ", "\t", "\u0001", "\u007f")
+        toType <- Seq(DataTypes.TimestampType, DataTypes.TimestampNTZType)
+      } castTest(Seq(value).toDF("a"), toType, expectAnsiFailure = true)
+    }
+  }
+
   private val castStringToIntegralInputs: Seq[String] = Seq(
     "",
     ".",
@@ -1524,6 +1547,13 @@ class CometNativeCastSuite extends CometTestBase with AdaptiveSparkPlanHelper {
         " T2:30",
         "\tT2:30",
         "\nT2:30",
+        // ISO control characters are trimmed like whitespace, on either side
+        "\u0001T2",
+        "\u007fT2:30",
+        "T2\u0001",
+        // Non-ASCII whitespace is never trimmed (null on all versions)
+        "\u3000T2",
+        "T2\u3000",
         // Full datetime: leading whitespace (valid on all versions — full trim applies)
         " 2020-01-01T12:34:56",
         "\t2020-01-01T12:34:56",
@@ -2209,6 +2239,75 @@ class CometNativeCastSuite extends CometTestBase with AdaptiveSparkPlanHelper {
         Unsupported(Some(expectedMessage)))
   }
 
+  // https://github.com/apache/datafusion-comet/issues/6200
+  // Nested isSupported used to return the first non-Compatible child, so an earlier
+  // Incompatible (negative-scale decimal → string) could mask a later Unsupported.
+  // Boolean → Decimal is Unsupported; that pair is used as the Unsupported child.
+  test("struct to struct prefers Unsupported over Incompatible regardless of field order") {
+    val (negScaleType, unsupportedTo) = nestedCastSupportFixtures()
+    val unsupportedReason =
+      Some(s"Cast from $BooleanType to $unsupportedTo is not supported")
+    def struct(a: DataType, b: DataType): StructType =
+      StructType(Seq(StructField("a", a), StructField("b", b)))
+    withSQLConf("spark.sql.legacy.allowNegativeScaleOfDecimal" -> "false") {
+      assert(
+        CometCast.isSupported(
+          struct(negScaleType, BooleanType),
+          struct(StringType, unsupportedTo),
+          None,
+          CometEvalMode.TRY) == Unsupported(unsupportedReason))
+      assert(
+        CometCast.isSupported(
+          struct(BooleanType, negScaleType),
+          struct(unsupportedTo, StringType),
+          None,
+          CometEvalMode.TRY) == Unsupported(unsupportedReason))
+    }
+  }
+
+  test("struct to string prefers Unsupported over Incompatible regardless of field order") {
+    val (negScaleType, _) = nestedCastSupportFixtures()
+    val unsupportedFrom = MapType(IntegerType, IntegerType)
+    val unsupportedReason =
+      Some(s"Cast from $unsupportedFrom to ${DataTypes.StringType} is not supported")
+    def struct(a: DataType, b: DataType): StructType =
+      StructType(Seq(StructField("a", a), StructField("b", b)))
+    withSQLConf("spark.sql.legacy.allowNegativeScaleOfDecimal" -> "false") {
+      assert(
+        CometCast.isSupported(
+          struct(negScaleType, unsupportedFrom),
+          StringType,
+          None,
+          CometEvalMode.TRY) == Unsupported(unsupportedReason))
+      assert(
+        CometCast.isSupported(
+          struct(unsupportedFrom, negScaleType),
+          StringType,
+          None,
+          CometEvalMode.TRY) == Unsupported(unsupportedReason))
+    }
+  }
+
+  test("map prefers Unsupported over Incompatible regardless of key/value order") {
+    val (negScaleType, unsupportedTo) = nestedCastSupportFixtures()
+    val unsupportedReason =
+      Some(s"Cast from $BooleanType to $unsupportedTo is not supported")
+    withSQLConf("spark.sql.legacy.allowNegativeScaleOfDecimal" -> "false") {
+      assert(
+        CometCast.isSupported(
+          MapType(negScaleType, BooleanType),
+          MapType(StringType, unsupportedTo),
+          None,
+          CometEvalMode.TRY) == Unsupported(unsupportedReason))
+      assert(
+        CometCast.isSupported(
+          MapType(BooleanType, negScaleType),
+          MapType(unsupportedTo, StringType),
+          None,
+          CometEvalMode.TRY) == Unsupported(unsupportedReason))
+    }
+  }
+
   test("cast ArrayType(DateType) to unsupported ArrayType routes through codegen dispatch") {
     // Boundary case rather than dispatch coverage: these pairs have no native cast, so all this
     // asserts is that `Unsupported` keeps the operator native via `CodegenDispatchFallback`
@@ -2364,6 +2463,16 @@ class CometNativeCastSuite extends CometTestBase with AdaptiveSparkPlanHelper {
         }
       }
     }
+  }
+
+  // DecimalType(10, -2) must be built while negative scale is allowed; the constructor
+  // itself checks the config. Boolean → Decimal is the nested Unsupported child.
+  private def nestedCastSupportFixtures(): (DecimalType, DecimalType) = {
+    var negScaleType: DecimalType = null
+    withSQLConf("spark.sql.legacy.allowNegativeScaleOfDecimal" -> "true") {
+      negScaleType = DecimalType(10, -2)
+    }
+    (negScaleType, DecimalType(10, 2))
   }
 
   private def isCompatible(
