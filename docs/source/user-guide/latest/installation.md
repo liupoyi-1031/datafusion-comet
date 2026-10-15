@@ -187,7 +187,7 @@ Comet will log output similar to this on Spark 4.0 and later:
 INFO core/src/lib.rs: Comet native library version $COMET_VERSION initialized
 WARN CometExecRule: Comet cannot execute some parts of this plan natively (set spark.comet.explain.fallback.enabled=false to disable this logging):
   Execute InsertIntoHadoopFsRelationCommand
-+- WriteFiles [COMET: Native support for operator WriteFilesExec is disabled. Set spark.comet.parquet.write.enabled=true to enable it.]
++- WriteFiles [COMET: Native support for operator WriteFilesExec is disabled. Set spark.comet.write.parquet.enabled=true to enable it.]
    +-  LocalTableScan [COMET: Native support for operator LocalTableScanExec is disabled. Set spark.comet.exec.localTableScan.enabled=true to enable it.]
 ```
 
@@ -269,8 +269,9 @@ If the application uses Kryo (`spark.serializer=org.apache.spark.serializer.Kryo
 
 Without it, any query that uses Comet's native broadcast exchange, which is enabled by default,
 fails with Kryo's "Class is not registered" error, for example on the first broadcast hash join.
-The [in-memory cache](in-memory-cache.md#kryo) needs the same registrator. Set it before the
-`SparkContext` is created: `KryoSerializer` reads it before Comet's plugin runs, so Comet cannot
-add it for you. `spark.kryo.registrator` accepts a comma-separated list, so an application with
-its own registrator can list both. Comet logs a warning at startup when Kryo requires registration
-and this registrator is missing.
+Comet's [in-memory cache](in-memory-cache.md#kryo) format needs the same registrations, and while
+Kryo has not registered Comet's cached batch, Comet's plugin keeps caches in Spark's format. Set it
+before the `SparkContext` is created: `KryoSerializer` reads it before Comet's plugin runs, so
+Comet cannot add it for you. `spark.kryo.registrator` accepts a comma-separated list, so an
+application with its own registrator can list both. Comet logs a warning at startup when Kryo
+requires registration and has not registered the classes this registrator covers.
