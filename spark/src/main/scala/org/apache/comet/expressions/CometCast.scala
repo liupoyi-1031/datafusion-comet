@@ -19,6 +19,8 @@
 
 package org.apache.comet.expressions
 
+import scala.util.Try
+
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Cast, Expression, Literal}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{ArrayType, DataType, DataTypes, DecimalType, MapType, NullType, StructType, TimestampNTZType, TimestampType}
@@ -39,6 +41,12 @@ object CometCast
   // Shared with CometNativeCastSuite so the asserted reason cannot drift from production.
   private[comet] val negativeScaleDecimalToStringReason: String =
     "Negative-scale decimal requires spark.sql.legacy.allowNegativeScaleOfDecimal=true"
+
+  // The native decimal to integral kernels divide by 10^scale, which overflows for a negative
+  // scale. A debug build panics on any batch with a value and a release build wraps the divisor,
+  // so the cast is left to Spark. Shared with CometNativeCastSuite like the reason above.
+  private[comet] val negativeScaleDecimalToIntegralReason: String =
+    "Cast from a negative-scale decimal to an integral type is not supported"
 
   // When `spark.sql.legacy.castComplexTypesToString.enabled` is true, Spark wraps maps and
   // structs with `[]` (instead of `{}`) when casting to string, and omits NULL elements of
@@ -105,6 +113,13 @@ object CometCast
       if (isVariantType(cast.child.dataType) || isVariantType(cast.dataType)) {
         return unsupported(cast.child.dataType, cast.dataType)
       }
+      if (Try(cast.eval()).isFailure) {
+        // The cast fails for this literal, and Spark's `ConstantFolding` kept it because it sits
+        // in a conditional branch that may never run. Spark's own `Cast` must raise the error
+        // only when a row reaches it, so route it through the JVM codegen dispatcher (or fall
+        // back to Spark) rather than a native cast whose parsing could accept the literal.
+        return Unsupported(Some(failedLiteralCastReason))
+      }
       Compatible()
     } else if (CometTimeZone.nativeId(cast.timeZoneId).isEmpty) {
       CometTimeZone.supportLevel(cast.timeZoneId)
@@ -134,6 +149,9 @@ object CometCast
         }
     }
   }
+
+  private val failedLiteralCastReason: String =
+    "Cast of a literal that fails to evaluate runs Spark's Cast so it fails only if reached"
 
 //  Some casts like date -> int/byte / long are always null. Terminate early in planning
   private def isAlwaysCastToNull(
@@ -248,8 +266,8 @@ object CometCast
         canCastToString(fromType, timeZoneId, evalMode)
       case (DataTypes.TimestampType, _) =>
         canCastFromTimestamp(toType)
-      case (_: DecimalType, _) =>
-        canCastFromDecimal(toType)
+      case (d: DecimalType, _) =>
+        canCastFromDecimal(d, toType)
       case (DataTypes.BooleanType, _) =>
         canCastFromBoolean(toType, evalMode)
       case (DataTypes.ByteType, _) =>
@@ -265,23 +283,18 @@ object CometCast
       case (DataTypes.DoubleType, _) =>
         canCastFromDouble(toType)
       case (from_struct: StructType, to_struct: StructType) =>
-        from_struct.fields.zip(to_struct.fields).foreach { case (a, b) =>
-          // `convert` replaces a top-level cast that is always null (DATE to a numeric or boolean
-          // type in LEGACY mode) with a null literal, so the native cast never sees one. A struct
-          // field or map entry does reach it, and there DATE to INT reinterprets the day count
-          // (the kernel `unix_date` relies on) while the other targets raise an error. Arrays of
-          // dates have their own rule above.
+        // `convert` replaces a top-level cast that is always null (DATE to a numeric or boolean
+        // type in LEGACY mode) with a null literal, so the native cast never sees one. A struct
+        // field or map entry does reach it, and there DATE to INT reinterprets the day count
+        // (the kernel `unix_date` relies on) while the other targets raise an error. Arrays of
+        // dates have their own rule above.
+        combineSupportLevels(from_struct.fields.zip(to_struct.fields).map { case (a, b) =>
           if (isAlwaysCastToNull(a.dataType, b.dataType, evalMode)) {
-            return unsupported(fromType, toType)
+            unsupported(fromType, toType)
+          } else {
+            isSupported(a.dataType, b.dataType, timeZoneId, evalMode)
           }
-          isSupported(a.dataType, b.dataType, timeZoneId, evalMode) match {
-            case Compatible(_, _) =>
-            // all good
-            case other =>
-              return other
-          }
-        }
-        Compatible()
+        })
       case (from_map: MapType, to_map: MapType) =>
         // Native cast_map_to_map recursively casts keys and values, so support is
         // determined by whether both inner casts are individually supported. As with struct
@@ -290,11 +303,10 @@ object CometCast
           isAlwaysCastToNull(from_map.valueType, to_map.valueType, evalMode)) {
           unsupported(fromType, toType)
         } else {
-          isSupported(from_map.keyType, to_map.keyType, timeZoneId, evalMode) match {
-            case Compatible(_, _) =>
-              isSupported(from_map.valueType, to_map.valueType, timeZoneId, evalMode)
-            case other => other
-          }
+          combineSupportLevels(
+            Seq(
+              isSupported(from_map.keyType, to_map.keyType, timeZoneId, evalMode),
+              isSupported(from_map.valueType, to_map.valueType, timeZoneId, evalMode)))
         }
       case (DataTypes.DateType, toType) => canCastFromDate(toType, evalMode)
       case _ => unsupported(fromType, toType)
@@ -361,16 +373,9 @@ object CometCast
       case DataTypes.BinaryType =>
         Compatible()
       case StructType(fields) =>
-        for (field <- fields) {
-          isSupported(field.dataType, DataTypes.StringType, timeZoneId, evalMode) match {
-            case s: Incompatible =>
-              return s
-            case u: Unsupported =>
-              return u
-            case _ =>
-          }
-        }
-        Compatible()
+        combineSupportLevels(fields.map { field =>
+          isSupported(field.dataType, DataTypes.StringType, timeZoneId, evalMode)
+        })
       case _ => unsupported(fromType, DataTypes.StringType)
     }
   }
@@ -491,13 +496,17 @@ object CometCast
     case _ => unsupported(DataTypes.DoubleType, toType)
   }
 
-  private def canCastFromDecimal(toType: DataType): SupportLevel = toType match {
-    case DataTypes.FloatType | DataTypes.DoubleType | DataTypes.ByteType | DataTypes.ShortType |
-        DataTypes.IntegerType | DataTypes.LongType | DataTypes.BooleanType |
-        DataTypes.TimestampType =>
-      Compatible()
-    case _ => Unsupported(Some(s"Cast from DecimalType to $toType is not supported"))
-  }
+  private def canCastFromDecimal(fromType: DecimalType, toType: DataType): SupportLevel =
+    toType match {
+      case DataTypes.ByteType | DataTypes.ShortType | DataTypes.IntegerType | DataTypes.LongType
+          if fromType.scale < 0 =>
+        Unsupported(Some(negativeScaleDecimalToIntegralReason))
+      case DataTypes.FloatType | DataTypes.DoubleType | DataTypes.ByteType | DataTypes.ShortType |
+          DataTypes.IntegerType | DataTypes.LongType | DataTypes.BooleanType |
+          DataTypes.TimestampType =>
+        Compatible()
+      case _ => Unsupported(Some(s"Cast from DecimalType to $toType is not supported"))
+    }
 
   private def canCastFromDate(toType: DataType, evalMode: CometEvalMode.Value): SupportLevel =
     toType match {
@@ -514,5 +523,16 @@ object CometCast
 
   private def unsupported(fromType: DataType, toType: DataType): Unsupported = {
     Unsupported(Some(s"Cast from $fromType to $toType is not supported"))
+  }
+
+  /**
+   * Nested casts report the most restrictive child support level. `Unsupported` wins over
+   * `Incompatible`, which wins over `Compatible`. Child order must not change the result.
+   */
+  private def combineSupportLevels(levels: Iterable[SupportLevel]): SupportLevel = {
+    levels
+      .collectFirst { case u: Unsupported => u }
+      .orElse(levels.collectFirst { case i: Incompatible => i })
+      .getOrElse(Compatible())
   }
 }

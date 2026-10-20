@@ -148,6 +148,18 @@ differences are acceptable for your data.
 The check uses the Spark version number, not the changes a build contains. A vendor build that
 reports an older version but includes SPARK-54918 or SPARK-59602 still falls back.
 
+## `arrays_overlap`
+
+`arrays_overlap` runs natively on every Spark version and follows that version's rule for `FLOAT`
+and `DOUBLE` elements in a flat array. Spark 4.0.5+, 4.1.4+, and 4.2+ treat `-0.0` and `0.0` as one
+value (SPARK-54918, SPARK-59602), and earlier releases keep them apart. Every NaN representation is
+one value on every version, and nested arrays and structs compare their elements in Spark's order,
+in which the two zeros are equal.
+
+Comet chooses the rule by the Spark version number. On a vendor build that reports an older
+version but includes SPARK-59602, Comet returns `false` for two flat arrays whose only common value
+is a zero of opposite sign, where Spark returns `true`.
+
 ## `array_contains`, `array_remove` and `sort_array`
 
 `array_contains` compares `FLOAT` and `DOUBLE` elements as Spark does: `-0.0` equals `0.0`, and all
@@ -164,3 +176,11 @@ representations tie, and keeps equal elements in their original order. In an arr
 can be null, such as one built from nullable columns, `-0.0` and `0.0` therefore tie. Sorting an
 array whose elements cannot be null in ascending order, Spark's generated code puts `-0.0` before
 `0.0`, and so does Comet. All three expressions run natively in strict floating-point mode.
+
+## Map construction
+
+`map_from_arrays` and `map_from_entries` don't build a map natively when its key type holds a
+`FLOAT` or `DOUBLE` at any depth. They run Spark's code through the codegen dispatcher instead, so
+duplicate keys, including NaNs and zeros of either sign, behave as in Spark. `FLOAT` and `DOUBLE`
+values don't affect either function. The expressions' entries in the
+[expression compatibility guide](expressions/map.md) give the reason.
